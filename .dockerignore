@@ -1,0 +1,8 @@
+node_modules
+dist
+coverage
+.git
+.local
+.env
+.env.*
+Secure_API_Code_Challenge.docx.md
