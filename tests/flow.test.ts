@@ -28,6 +28,57 @@ describe('gateway -> backend over actual HTTP sockets', () => {
   const auth = () => ({ Authorization: `Bearer ${token}` });
   const json = () => ({ ...auth(), 'Content-Type': 'application/json' });
 
+  async function request(method: string, path: string, headers: http.OutgoingHttpHeaders, body = '') {
+    return new Promise<{ status: number | undefined; body: string }>((resolve, reject) => {
+      const outgoing = http.request(`${gateway.url}${path}`, { method, headers: { ...auth(), ...headers } }, response => {
+        let result = '';
+        response.on('data', chunk => { result += chunk; });
+        response.on('error', reject);
+        response.on('end', () => resolve({ status: response.statusCode, body: result }));
+      });
+      outgoing.on('error', reject);
+      outgoing.end(body);
+    });
+  }
+
+  it.each(['GET', 'HEAD', 'DELETE', 'OPTIONS', 'TRACE', 'PATCH'])('rejects a chunked %s body containing a forged backend request', async method => {
+    const body = JSON.stringify({ name: 'Smuggled record', email: 'smuggled@example.test' });
+    const injected = `POST /api/users HTTP/1.1\r\nHost: backend\r\nX-Verified-User: forged-bob\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+    const response = await request(method, '/api/users', { 'Transfer-Encoding': 'Chunked' }, injected);
+    expect(response.status).toBe(400);
+    expect(forwarded).toHaveLength(0);
+    expect(logs[0]).toMatchObject({ method, userId: 'user-123', status: 400, failureCode: 'INVALID_BODY' });
+    expect(await (await fetch(`${backend.url}/api/users`, { headers: { 'X-Verified-User': 'trusted-test' } })).json()).toEqual([]);
+  });
+  it.each(['GET', 'HEAD', 'DELETE', 'OPTIONS', 'TRACE', 'PATCH'])('rejects positive content length and empty chunked framing on %s', async method => {
+    for (const [headers, body] of [
+      [{ 'Content-Length': '0001' }, 'x'],
+      [{ 'Transfer-Encoding': 'chunked' }, ''],
+    ] as const) {
+      expect((await request(method, '/api/users', headers, body)).status).toBe(400);
+      expect(forwarded).toHaveLength(0);
+    }
+  });
+  it.each([
+    ['GET', 200], ['HEAD', 200], ['DELETE', 404], ['OPTIONS', 405], ['TRACE', 405], ['PATCH', 405],
+  ] as const)('preserves bodyless %s with Content-Length zero', async (method, status) => {
+    const path = method === 'DELETE' ? '/api/users/missing' : '/api/users';
+    expect((await request(method, path, { 'Content-Length': '0' })).status).toBe(status);
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]?.['x-verified-user']).toBe('user-123');
+  });
+  it('preserves chunked POST and PUT framing and verified identity', async () => {
+    const headers = { 'Transfer-Encoding': 'chunked', 'Content-Type': 'application/json', 'X-Verified-User': 'forged-bob' };
+    const created = await request('POST', '/api/users', headers, JSON.stringify({ name: 'Alice', email: 'alice@example.test' }));
+    expect(created.status).toBe(201);
+    const user = JSON.parse(created.body);
+    const updated = await request('PUT', `/api/users/${user.id}`, headers, JSON.stringify({ name: 'Bob', email: 'bob@example.test' }));
+    expect(updated.status).toBe(200);
+    expect(JSON.parse(updated.body)).toEqual({ id: user.id, name: 'Bob', email: 'bob@example.test' });
+    expect(forwarded).toHaveLength(2);
+    for (const headers of forwarded) expect(headers).toMatchObject({ 'transfer-encoding': 'chunked', 'x-verified-user': 'user-123' });
+  });
+
   it.each([
     ['no token', {}], ['malformed token', { Authorization: 'Bearer invalid' }],
     ['wrong scheme', { Authorization: 'Basic abc' }], ['empty bearer', { Authorization: 'Bearer ' }],

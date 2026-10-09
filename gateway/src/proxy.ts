@@ -5,6 +5,14 @@ import type { RequestHandler } from 'express';
 export function proxyTo(backend: URL): RequestHandler {
   const transport = backend.protocol === 'https:' ? https : http;
   return (req, res) => {
+    // Only POST/PUT have API bodies. Decoded chunks on other methods can lose
+    // outbound framing and be parsed as a second, unverified backend request.
+    if (!['POST', 'PUT'].includes(req.method) &&
+        (req.headers['transfer-encoding'] !== undefined || Number(req.headers['content-length'] ?? 0) > 0)) {
+      res.locals.failureCode = 'INVALID_BODY';
+      res.set('Connection', 'close').status(400).json({ error: 'Request body not allowed for this method', requestId: res.locals.requestId });
+      return;
+    }
     // An allowlist prevents bearer tokens, cookies, spoofed identity/forwarding and
     // hop-by-hop Connection headers crossing the authentication boundary.
     const headers: http.OutgoingHttpHeaders = { 'x-verified-user': res.locals.userId, 'x-request-id': res.locals.requestId };
