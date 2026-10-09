@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import type { RequestHandler } from 'express';
+import { errorDetails } from '../../shared/logging.js';
 
 export function proxyTo(backend: URL): RequestHandler {
   const transport = backend.protocol === 'https:' ? https : http;
@@ -21,21 +22,32 @@ export function proxyTo(backend: URL): RequestHandler {
     }
     const upstream = transport.request(backend, { method: req.method, path: req.originalUrl, headers }, response => {
       res.status(response.statusCode ?? 502);
+      if (res.statusCode >= 500) res.locals.failureCode = 'BACKEND_ERROR';
       for (const name of ['content-type', 'content-length', 'location']) {
         if (response.headers[name] !== undefined) res.setHeader(name, response.headers[name]);
       }
-      response.on('error', () => res.destroy());
+      response.on('error', error => fail(response.complete ? 'UPSTREAM_RESPONSE_ERROR' : 'UPSTREAM_RESPONSE_TRUNCATED', error));
       response.pipe(res);
     });
-    const timer = setTimeout(() => upstream.destroy(new Error('Upstream deadline exceeded')), 5000);
-    upstream.on('error', () => {
-      res.locals.failureCode = 'UPSTREAM_UNAVAILABLE';
+    function fail(code: string, error?: unknown) {
+      if (res.destroyed || res.locals.terminationCause) return;
+      res.locals.terminationCause = 'upstream_failure';
+      res.locals.failureCode = code;
+      const details = errorDetails(error);
+      if (details.errorCode) res.locals.errorCode = details.errorCode;
       if (res.headersSent) { res.destroy(); return; }
       res.status(502).json({ error: 'Bad gateway', requestId: res.locals.requestId });
-    });
+    }
+    const timer = setTimeout(() => { fail('UPSTREAM_TIMEOUT'); upstream.destroy(); }, 5000);
+    upstream.on('error', error => fail('UPSTREAM_CONNECTION_ERROR', error));
     res.once('close', () => { clearTimeout(timer); upstream.destroy(); });
-    req.once('aborted', () => upstream.destroy());
-    req.once('error', () => upstream.destroy());
+    const cancel = () => {
+      res.locals.terminationCause ??= 'client_aborted';
+      res.locals.failureCode ??= 'CLIENT_ABORTED';
+      upstream.destroy();
+    };
+    req.once('aborted', cancel);
+    req.once('error', cancel);
     req.pipe(upstream);
   };
 }

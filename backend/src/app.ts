@@ -2,14 +2,18 @@ import { randomUUID } from 'node:crypto';
 import express from 'express';
 import type { RequestHandler } from 'express';
 import { requestContext, notFound, errorHandler, isHeaderIdentity } from '../../shared/http.js';
+import { requestLog, jsonLog, jsonError } from '../../shared/logging.js';
+import type { LogSink } from '../../shared/logging.js';
 
 interface User { id: string; name: string; email: string }
 
 const requireGateway: RequestHandler = (req, res, next) => {
   if (!isHeaderIdentity(req.headers['x-verified-user'])) {
+    res.locals.failureCode = 'INVALID_GATEWAY_IDENTITY';
     res.status(403).json({ error: 'Forbidden', requestId: res.locals.requestId });
     return;
   }
+  res.locals.userId = req.headers['x-verified-user'];
   const requestId = req.headers['x-request-id'];
   if (typeof requestId === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(requestId)) {
     res.locals.requestId = requestId;
@@ -31,15 +35,16 @@ function userInput(body: unknown): { name: string; email: string } | undefined {
   return { name, email };
 }
 
-export function createBackend() {
+export function createBackend(options: { log?: LogSink } = {}) {
   const users = new Map<string, User>();
   const app = express();
   app.disable('x-powered-by');
-  app.use(requestContext);
+  app.use(requestContext, requestLog('backend', options.log ?? jsonLog));
   // Every backend route, including unmatched paths, requires a gateway identity.
   app.use(requireGateway);
   app.use((req, res, next) => {
     if (['POST', 'PUT'].includes(req.method) && !req.is('application/json')) {
+      res.locals.failureCode = 'UNSUPPORTED_MEDIA_TYPE';
       res.status(415).json({ error: 'Content-Type must be application/json', requestId: res.locals.requestId });
       return;
     }
@@ -54,7 +59,7 @@ export function createBackend() {
   });
   app.post('/api/users', (req, res) => {
     const input = userInput(req.body);
-    if (!input) { res.status(400).json({ error: 'Provide only a valid name and email', requestId: res.locals.requestId }); return; }
+    if (!input) { res.locals.failureCode = 'INVALID_USER_INPUT'; res.status(400).json({ error: 'Provide only a valid name and email', requestId: res.locals.requestId }); return; }
     const user = { id: randomUUID(), ...input };
     users.set(user.id, user);
     res.status(201).location(`/api/users/${user.id}`).json(user);
@@ -62,7 +67,7 @@ export function createBackend() {
   app.put('/api/users/:id', (req, res, next) => {
     if (!users.has(req.params.id)) { notFound(req, res, next); return; }
     const input = userInput(req.body);
-    if (!input) { res.status(400).json({ error: 'Provide only a valid name and email', requestId: res.locals.requestId }); return; }
+    if (!input) { res.locals.failureCode = 'INVALID_USER_INPUT'; res.status(400).json({ error: 'Provide only a valid name and email', requestId: res.locals.requestId }); return; }
     const user = { id: req.params.id, ...input };
     users.set(user.id, user);
     res.json(user);
@@ -72,8 +77,9 @@ export function createBackend() {
     res.status(204).end();
   });
   app.all(['/api/users', '/api/users/:id'], (_req, res) => {
+    res.locals.failureCode = 'METHOD_NOT_ALLOWED';
     res.set('Allow', 'GET, HEAD, POST, PUT, DELETE').status(405).json({ error: 'Method not allowed', requestId: res.locals.requestId });
   });
-  app.use(notFound, errorHandler);
+  app.use(notFound, errorHandler('backend', options.log ?? jsonError));
   return app;
 }

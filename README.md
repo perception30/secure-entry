@@ -148,9 +148,9 @@ In native mode, `curl -i http://localhost:3001/api/users` returns 403. Adding a 
 ## Implementation and verification
 
 ```text
-gateway/src/   authentication.ts | policy.ts | proxy.ts | logging.ts | app.ts | server.ts
+gateway/src/   authentication.ts | policy.ts | proxy.ts | app.ts | server.ts
 backend/src/   app.ts | server.ts
-shared/        HTTP context/errors, configuration and process lifecycle
+shared/        HTTP context/errors, JSON logging, configuration and process lifecycle
 tests/         JWT/JWKS, complete HTTP flow, proxy failures, config/errors
 scripts/       Cognito bootstrap, PKCE login, live smoke test
 ```
@@ -176,10 +176,12 @@ GitHub Actions runs a clean install, lint, strict TypeScript checks, tests with 
 
 ## Logs and troubleshooting
 
-Gateway request logs are JSON on stdout. Every completed/aborted request records `timestamp`, `method`, `path`, socket `sourceIp`, verified `userId` or null, `requestId`, `status`, and `durationMs`. Failures add a stable `failureCode`. Query strings, request bodies, cookies, authorization headers and raw errors are excluded. Source IP is the direct TCP peer; untrusted `X-Forwarded-For` is ignored. Behind Docker/NAT it can be a bridge address.
+Both services emit JSON request logs on stdout with `service`, `timestamp`, `method`, `path`, socket `sourceIp`, verified `userId` or null, `requestId`, `status`, `durationMs`, and `terminationCause`. Request metadata is captured before socket teardown. The backend preserves the gateway request ID so its diagnostic events can be correlated. Failures add a specific `failureCode` and, for socket failures, `errorCode`. Client cancellations record 499; incomplete upstream responses record diagnostic status 502 and retain the original sent status in `responseStatus` (for example, an incomplete 200). Headers already sent to the client cannot be replaced with a JSON 502.
+
+Unexpected exceptions emit `request_error` on stderr with service, request ID, error category/code, and up to three source locations. Startup failures record the socket error code; invalid configuration records the exact `configKey` and validation code. Exception messages, query strings, request bodies, cookies, authorization headers and raw stacks are excluded. Client error payloads remain generic. Source IP is the direct TCP peer; untrusted `X-Forwarded-For` is ignored. Behind Docker/NAT it can be a bridge address.
 
 ```sh
-docker compose logs gateway
+docker compose logs gateway backend
 docker compose ps
 ```
 
@@ -190,8 +192,12 @@ docker compose ps
 | 401 / no matching key | Signing-key rotation cooldown, trusted JWKS URL, IdP connectivity |
 | 403 at gateway | Token must contain the API `/users` scope |
 | 403 at backend | Request did not contain the gateway identity header |
-| 502 | Backend startup/address or the 5-second upstream deadline |
-| Startup configuration error | Compare `.env` to `.env.example`; OIDC URLs must be HTTPS |
+| `UPSTREAM_CONNECTION_ERROR` | Use `errorCode` to distinguish connection refusal, DNS failure or reset; check backend address/startup |
+| `UPSTREAM_TIMEOUT` | Backend did not finish within the 5-second deadline |
+| `UPSTREAM_RESPONSE_TRUNCATED` | Backend disconnected mid-response; inspect its logs using `requestId` |
+| `BACKEND_ERROR` / `INTERNAL_ERROR` | Find the backend/gateway `request_error` with the same request ID and inspect its source locations |
+| Startup configuration error | Correct the reported `configKey`; compare `.env` to `.env.example` |
+| `startup_failed` / `EADDRINUSE` | Another process is already using the configured host/port |
 | Browser callback looks blocked | Check the login terminal for verified-token success; it closes its callback server after one use |
 
 ## PoC limits and cleanup

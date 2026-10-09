@@ -13,13 +13,14 @@ describe('gateway -> backend over actual HTTP sockets', () => {
   let token: string;
   let forwarded: http.IncomingHttpHeaders[];
   let logs: Record<string, unknown>[];
+  let backendLogs: Record<string, unknown>[];
   beforeAll(async () => { key = await signingKey('flow'); });
   beforeEach(async () => {
-    forwarded = []; logs = [];
+    forwarded = []; logs = []; backendLogs = [];
     provider = await listen((_req, res) => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ keys: [key.jwk] })); });
     const app = express();
     app.use((req, _res, next) => { forwarded.push(req.headers); next(); });
-    app.use(createBackend());
+    app.use(createBackend({ log: entry => backendLogs.push(entry) }));
     backend = await listen(app);
     gateway = await listen(createGateway({ issuer: provider.url, audience, clientId, jwksUrl: new URL(provider.url), backendUrl: new URL(backend.url) }, { log: entry => logs.push(entry) }));
     token = await sign(key, claims(provider.url));
@@ -117,8 +118,9 @@ describe('gateway -> backend over actual HTTP sockets', () => {
     expect(forwarded[0]).not.toHaveProperty('cookie');
     expect(forwarded[0]).not.toHaveProperty('x-forwarded-for');
     expect(logs[0]).toMatchObject({ method: 'GET', path: '/api/users', sourceIp: '127.0.0.1', userId: 'user-123', status: 200 });
+    expect(backendLogs[0]).toMatchObject({ service: 'backend', event: 'request', requestId: response.headers.get('x-request-id'), method: 'GET', path: '/api/users', sourceIp: '127.0.0.1', userId: 'user-123', status: 200 });
     expect(new Date(logs[0]?.timestamp as string).toISOString()).toBe(logs[0]?.timestamp);
-    const output = JSON.stringify(logs);
+    const output = JSON.stringify([...logs, ...backendLogs]);
     for (const secret of [token, 'hidden', 'secret=cookie', '203.0.113.1']) expect(output).not.toContain(secret);
   });
   it('does not let a caller nominate the verified identity as a hop-by-hop header', async () => {
@@ -133,6 +135,7 @@ describe('gateway -> backend over actual HTTP sockets', () => {
   it.each(['GET', 'POST', 'PUT', 'DELETE'])('blocks direct %s requests without a trusted identity', async method => {
     const response = await fetch(`${backend.url}/api/users`, { method, headers: auth() });
     expect(response.status).toBe(403);
+    expect(backendLogs[0]).toMatchObject({ service: 'backend', status: 403, userId: null, failureCode: 'INVALID_GATEWAY_IDENTITY' });
   });
   it('implements the required header trust contract without backend JWT validation', async () => {
     const response = await fetch(`${backend.url}/api/users`, { headers: { 'X-Verified-User': 'trusted-user', Authorization: 'not a jwt' } });
@@ -165,11 +168,11 @@ describe('gateway -> backend over actual HTTP sockets', () => {
     expect(response.status).toBe(400);
   });
   it('rejects malformed, oversized, compressed, and unsupported request bodies cleanly', async () => {
-    for (const [body, headers, expected] of [
-      ['{', json(), 400], ['x'.repeat(17000), json(), 413],
-      ['{}', { ...json(), 'Content-Encoding': 'gzip' }, 415],
-      ['{}', { ...auth(), 'Content-Type': 'text/plain' }, 415],
-      ['{}', { ...auth(), 'Content-Type': 'application/json; charset=unknown' }, 415],
+    for (const [body, headers, expected, failureCode] of [
+      ['{', json(), 400, 'INVALID_JSON'], ['x'.repeat(17000), json(), 413, 'REQUEST_BODY_TOO_LARGE'],
+      ['{}', { ...json(), 'Content-Encoding': 'gzip' }, 415, 'UNSUPPORTED_ENCODING'],
+      ['{}', { ...auth(), 'Content-Type': 'text/plain' }, 415, 'UNSUPPORTED_MEDIA_TYPE'],
+      ['{}', { ...auth(), 'Content-Type': 'application/json; charset=unknown' }, 415, 'UNSUPPORTED_CHARSET'],
     ] as const) {
       const response = await fetch(`${gateway.url}/api/users`, { method: 'POST', headers, body });
       expect(response.status).toBe(expected);
@@ -177,6 +180,7 @@ describe('gateway -> backend over actual HTTP sockets', () => {
       expect(result.requestId).toBe(response.headers.get('x-request-id'));
       expect(result).not.toHaveProperty('stack');
       expect(result.error).not.toContain('SyntaxError');
+      expect(backendLogs.at(-1)).toMatchObject({ requestId: result.requestId, status: expected, failureCode });
     }
   });
   it('rejects an invalid update without modifying the existing user', async () => {
@@ -201,7 +205,7 @@ describe('gateway -> backend over actual HTTP sockets', () => {
     const response = await fetch(`${gateway.url}/api/users`, { headers: auth() });
     expect(response.status).toBe(502);
     expect(await response.json()).toMatchObject({ error: 'Bad gateway' });
-    expect(logs[0]).toMatchObject({ failureCode: 'UPSTREAM_UNAVAILABLE', status: 502 });
+    expect(logs[0]).toMatchObject({ failureCode: 'UPSTREAM_CONNECTION_ERROR', errorCode: 'ECONNREFUSED', status: 502 });
     // Replace the close function so cleanup is idempotent after this intentional outage.
     backend.close = async () => {};
   });
